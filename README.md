@@ -29,15 +29,25 @@
 
 Нужны macOS, DaVinci Resolve и [Homebrew](https://brew.sh).
 
+Открой **Терминал**, вставь команду и нажми Enter:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/stcav1011/tvorez/main/install.sh | sh
+```
+
+Установщик положит скрипт в меню Resolve и поставит `yt-dlp` и `ffmpeg`.
+Потом перезапусти DaVinci Resolve.
+
+<details>
+<summary>Через ZIP-архив</summary>
+
 1. На странице репозитория: **Code → Download ZIP**, распакуй архив.
-2. Открой **Терминал** и выполни (путь поправь, если распаковал в другое место):
+2. В Терминале (путь поправь, если распаковал в другое место):
 
    ```bash
    sh ~/Downloads/tvorez-main/install.sh
    ```
-
-   Установщик положит скрипт в меню Resolve и поставит `yt-dlp` и `ffmpeg`.
-3. Перезапусти DaVinci Resolve.
+</details>
 
 <details>
 <summary>Установка вручную</summary>

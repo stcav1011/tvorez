@@ -1,13 +1,20 @@
 #!/bin/sh
 # Установка TVOREZ: кладёт скрипт в меню DaVinci Resolve и ставит yt-dlp + ffmpeg.
-# Запуск из папки с репозиторием: sh install.sh
+# Из папки с репозиторием: sh install.sh
+# Без скачивания репозитория:
+#   curl -fsSL https://raw.githubusercontent.com/stcav1011/tvorez/main/install.sh | sh
 set -e
 
-HERE=$(cd "$(dirname "$0")" && pwd)
+RAW="https://raw.githubusercontent.com/stcav1011/tvorez/main"
 DEST="$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
 
 mkdir -p "$DEST"
-cp "$HERE/tvorez.lua" "$DEST/tvorez.lua"
+if [ -f "$0" ] && [ -f "$(dirname "$0")/tvorez.lua" ]; then
+  cp "$(dirname "$0")/tvorez.lua" "$DEST/tvorez.lua"
+else
+  echo "→ Скачиваю tvorez.lua с GitHub…"
+  curl -fsSL "$RAW/tvorez.lua" -o "$DEST/tvorez.lua"
+fi
 echo "✓ Скрипт установлен: $DEST/tvorez.lua"
 
 BREW=$(command -v brew || true)
