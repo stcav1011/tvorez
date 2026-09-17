@@ -1,6 +1,3 @@
-// Рисует графику интерфейса TVOREZ: шапку в HUD-стиле, стрелку списка и галочку.
-// Запуск: swiftc -O src/hud.swift -o /tmp/hudgen && /tmp/hudgen src/assets
-
 import CoreGraphics
 import CoreText
 import ImageIO
@@ -143,7 +140,7 @@ func banner(_ c: CGContext) {
   // тег версии
   c.setStrokeColor(red(1)); c.setLineWidth(1)
   c.stroke(CGRect(x: 262.5, y: H - 71.5, width: 34, height: 14))
-  text(c, "V2.0", 268, 67, font: "Menlo-Bold", size: 8, color: red(1), kern: 1)
+  text(c, "V2.1", 268, 67, font: "Menlo-Bold", size: 8, color: red(1), kern: 1)
 
   // линейка снизу
   var x: CGFloat = 22

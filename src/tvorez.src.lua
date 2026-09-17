@@ -2,15 +2,15 @@
   TVOREZ · загрузчик медиа для DaVinci Resolve (macOS)
   Меню: Workspace → Scripts → tvorez
 
-  Качает видео и звук по ссылкам (YouTube, Instagram, TikTok, VK, Vimeo
-  и ещё ~1800 сайтов) через yt-dlp в рабочую папку и сразу кладёт файлы
-  в Media Pool открытого проекта.
+  Качает видео и звук по ссылкам (YouTube, SoundCloud, Instagram, TikTok,
+  VK, Vimeo и ещё ~1800 сайтов) через yt-dlp в рабочую папку и сразу кладёт
+  файлы в Media Pool открытого проекта.
 
   Нужно: brew install yt-dlp ffmpeg
   Данные: ~/.tvorez — настройки, история и графика интерфейса
 ]]
 
-local VERSION = "2.0"
+local VERSION = "2.1"
 
 local resolve = resolve or bmd.scriptapp("Resolve")
 local fu = fu or fusion or resolve:Fusion()
@@ -107,12 +107,46 @@ local function tail(s, n)
   return "…" .. table.concat(chars, "", #chars - n + 2)
 end
 
+-- Safari держит cookies в защищённом контейнере: без «Полного доступа к диску»
+-- их не прочитать ни Resolve, ни yt-dlp.
+local SAFARI_COOKIES = HOME .. "/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"
+
+local function safariCookiesReadable()
+  local f = io.open(SAFARI_COOKIES, "rb")
+  if f then f:close() end
+  return f ~= nil
+end
+
+-- Частые причины отказа — человеческим языком, чтобы не лезть в журнал.
+local ERROR_HINTS = {
+  { "Operation not permitted.*[Cc]ookies", "macOS не даёт Resolve читать cookies браузера. Для SoundCloud и YouTube вход не нужен — поставь «Браузер: не использовать». Если нужен именно Safari: Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску → добавь DaVinci Resolve и перезапусти его." },
+  { "could not find.*cookies database", "Не нашёл cookies выбранного браузера. Выбери другой или поставь «Браузер: не использовать»." },
+  { "DRM protected", "Трек защищён от скачивания (DRM, обычно SoundCloud Go+). Скачать его нельзя — поищи другую версию." },
+  { "Private video", "Видео приватное. Нужен «Браузер» с аккаунтом, у которого есть доступ." },
+  { "sign in to confirm your age", "Видео с ограничением 18+. Выбери «Браузер» с аккаунтом, где подтверждён возраст." },
+  { "confirm you.?re not a bot", "YouTube просит подтвердить, что ты не робот. Выбери «Браузер» — скрипт возьмёт вход оттуда." },
+  { "Requested format is not available", "Нет подходящего формата. Попробуй другое качество или «Максимум»." },
+  { "Unsupported URL", "yt-dlp не знает этот сайт. Проверь ссылку." },
+  { "Video unavailable", "Видео недоступно: удалено или закрыто для твоей страны." },
+  { "Unable to download webpage", "Страница не открылась: проверь ссылку и интернет." },
+}
+
+local function explainError(log)
+  local lower = log:lower()
+  for _, hint in ipairs(ERROR_HINTS) do
+    if lower:match(hint[1]:lower()) then return hint[2] end
+  end
+end
+
 local function ytdlpVersion()
   return trim(run("readlink /opt/homebrew/opt/yt-dlp /usr/local/opt/yt-dlp 2>/dev/null")):match("yt%-dlp/([%d%.]+)")
 end
 
 local function ensureAssets()
   mkdir(ASSETS_DIR)
+  -- графика прошлых версий больше не нужна
+  os.execute(("find %s -maxdepth 1 -type d -name 'ui-*' ! -name %s -exec rm -rf {} +")
+    :format(sh(DATA_DIR), sh("ui-" .. VERSION)))
   for name, data in pairs(ASSETS) do
     local path = ASSETS_DIR .. "/" .. name
     if not fileExists(path) then
@@ -128,7 +162,7 @@ end
 
 local DEFAULTS = {
   dir = DEFAULT_DIR, perProject = "1", mode = "0", quality = "0",
-  bin = "Из интернета", timeline = "0", cookies = "0", playlist = "0",
+  bin = "Из интернета", timeline = "0", cookies = "0", playlist = "0", audiofmt = "0",
 }
 
 local function loadSettings()
@@ -180,7 +214,27 @@ end
 -------------------------------------------------------------------------------
 
 local MODE_AV, MODE_VIDEO, MODE_AUDIO = 1, 2, 3
-local MODES = { "ВИДЕО + ЗВУК  ·  MP4", "ТОЛЬКО ВИДЕО  ·  БЕЗ ЗВУКА", "ТОЛЬКО ЗВУК  ·  WAV" }
+local MODES = { "ВИДЕО + ЗВУК  ·  MP4", "ТОЛЬКО ВИДЕО  ·  БЕЗ ЗВУКА", "ТОЛЬКО ЗВУК" }
+
+local AUDIO_FORMATS = {
+  { label = "WAV  ·  для монтажа, без потерь", fmt = "wav" },
+  { label = "КАК В ИСТОЧНИКЕ  ·  MP3/M4A, легче", fmt = "best" },
+}
+
+-- Сайты без видео: для них режим «только звук» включается сам.
+local AUDIO_ONLY_HOSTS = { "soundcloud%.com", "bandcamp%.com", "mixcloud%.com", "audiomack%.com", "music%.yandex%." }
+
+local function looksAudioOnly(urls)
+  if #urls == 0 then return false end
+  for _, u in ipairs(urls) do
+    local hit = false
+    for _, host in ipairs(AUDIO_ONLY_HOSTS) do
+      if u:match(host) then hit = true break end
+    end
+    if not hit then return false end
+  end
+  return true
+end
 
 local QUALITIES = {
   { label = "1080p  ·  H.264  ·  рекомендую", height = 1080 },
@@ -192,9 +246,11 @@ local BROWSERS = { "не использовать", "chrome", "safari", "firefox
 
 -- H.264 + AAC в MP4 Resolve открывает везде и без тормозов. 4K YouTube
 -- отдаёт только в AV1/VP9, поэтому для «Максимума» берём AV1.
-local function formatArgs(mode, quality)
+local function formatArgs(mode, quality, audioFormat)
   if mode == MODE_AUDIO then
-    return { "-f", "ba/b", "-x", "--audio-format", "wav" }
+    -- «best» оставляет исходный кодек; opus и vorbis Resolve не читает,
+    -- их переводит в AAC шаг подготовки файлов ниже.
+    return { "-f", "ba/b", "-x", "--audio-format", AUDIO_FORMATS[audioFormat or 1].fmt, "--embed-metadata" }
   end
   local audio = mode == MODE_AV
   local h = QUALITIES[quality].height
@@ -242,23 +298,32 @@ while IFS= read -r f; do
     if [ -n "$NOAUDIO" ] && [ -n "$ac" ]; then how=copy; fi
     if [ "$ext" != mp4 ] && [ "$ext" != mov ]; then how=copy; fi
   fi
+  if [ -z "$how" ] && [ -z "$vc" ]; then
+    case "$ac" in
+      opus|vorbis) how=aac ;;
+    esac
+  fi
   if [ -n "$how" ]; then
-    target="$base.mp4"
-    tmp="$base.tvorez-tmp.mp4"
+    if [ "$how" = aac ]; then out_ext=m4a; else out_ext=mp4; fi
+    target="$base.$out_ext"
+    tmp="$base.tvorez-tmp.$out_ext"
     if [ "$how" = hevc ]; then
       echo "[convert] $vc -> HEVC: $(basename "$f")"
-      set -- -c:v hevc_videotoolbox -q:v 65 -tag:v hvc1
+      set -- -map 0:v:0 -map "0:a?" -c:v hevc_videotoolbox -q:v 65 -tag:v hvc1
+    elif [ "$how" = aac ]; then
+      echo "[convert] $ac -> AAC: $(basename "$f")"
+      set -- -vn -map 0:a:0 -map_chapters -1
     else
-      set -- -c:v copy
+      set -- -map 0:v:0 -map "0:a?" -c:v copy
     fi
-    if [ -n "$NOAUDIO" ]; then
+    if [ -n "$NOAUDIO" ] && [ "$how" != aac ]; then
       set -- "$@" -an
-    elif [ "$how" = hevc ] || [ "$ac" = opus ] || [ "$ac" = vorbis ]; then
+    elif [ "$how" = hevc ] || [ "$how" = aac ] || [ "$ac" = opus ] || [ "$ac" = vorbis ]; then
       set -- "$@" -c:a aac -b:a 256k
     else
       set -- "$@" -c:a copy
     fi
-    if ffmpeg -hide_banner -loglevel error -nostdin -y -i "$f" -map 0:v:0 -map "0:a?" "$@" "$tmp"; then
+    if ffmpeg -hide_banner -loglevel error -nostdin -y -i "$f" "$@" "$tmp"; then
       [ "$f" != "$target" ] && rm -f "$f"
       mv -f "$tmp" "$target"
     else
@@ -329,7 +394,7 @@ local function startDownload(opts)
     "--progress-template",
     "download:[prog]%(progress._percent_str)s\t%(progress._speed_str)s\t%(progress._eta_str)s\t%(info.title)s",
   }
-  for _, a in ipairs(formatArgs(opts.mode, opts.quality)) do args[#args + 1] = a end
+  for _, a in ipairs(formatArgs(opts.mode, opts.quality, opts.audioFormat)) do args[#args + 1] = a end
   if opts.clip then
     args[#args + 1] = "--download-sections"
     args[#args + 1] = ("*%s-%s"):format(opts.clip.from, opts.clip.to or "inf")
@@ -540,6 +605,8 @@ QPushButton { border: none; border-bottom: 2px solid transparent; color: @faint;
 QPushButton:hover { color: @text; }
 ]])
 
+local HINT_TEXT = "двойной клик — показать файл в Finder"
+
 local LINE_CSS = css("QLabel { background: @line; }")
 local DIM_CSS = css("QLabel { color: @dim; }")
 local FAINT_CSS = css("QLabel { color: @faint; }")
@@ -629,6 +696,7 @@ local function main()
       ui:HGroup{ Weight = 0,
         ui:ComboBox{ ID = "Mode", Weight = 1 },
         ui:ComboBox{ ID = "Quality", Weight = 1 },
+        ui:ComboBox{ ID = "AudioFormat", Weight = 1 },
       },
       ui:HGroup{ Weight = 0, Spacing = 10,
         ui:CheckBox{ ID = "Clip", Weight = 0, Text = "ТОЛЬКО ОТРЕЗОК" },
@@ -677,10 +745,12 @@ local function main()
         ui:Button{ ID = "TabHistory", Weight = 0, Text = "ИСТОРИЯ" },
         ui:Button{ ID = "TabLog", Weight = 0, Text = "ЖУРНАЛ" },
         ui:HGap(0, 1),
-        ui:Label{ ID = "Hint", Weight = 0, Text = "двойной клик — показать файл в Finder", StyleSheet = FAINT_CSS },
+        ui:Label{ ID = "Hint", Weight = 0, Text = HINT_TEXT, StyleSheet = FAINT_CSS },
       },
-      ui:Tree{ ID = "History", Weight = 1, MinimumSize = { 200, 110 } },
-      ui:TextEdit{ ID = "Log", Weight = 1, ReadOnly = true, MinimumSize = { 200, 110 } },
+      ui:Stack{ ID = "Views", Weight = 1, MinimumSize = { 200, 110 },
+        ui:Tree{ ID = "History" },
+        ui:TextEdit{ ID = "Log", ReadOnly = true },
+      },
 
       ui:Label{ Weight = 0, MinimumSize = { 10, 1 }, MaximumSize = { 16777215, 1 }, StyleSheet = LINE_CSS },
       ui:HGroup{ Weight = 0,
@@ -701,10 +771,12 @@ local function main()
   for _, m in ipairs(MODES) do itm.Mode:AddItem(m) end
   for _, q in ipairs(QUALITIES) do itm.Quality:AddItem(q.label) end
   for _, b in ipairs(BROWSERS) do itm.Cookies:AddItem(b) end
+  for _, a in ipairs(AUDIO_FORMATS) do itm.AudioFormat:AddItem(a.label) end
 
   itm.Mode.CurrentIndex = tonumber(settings.mode) or 0
   itm.Quality.CurrentIndex = tonumber(settings.quality) or 0
   itm.Cookies.CurrentIndex = tonumber(settings.cookies) or 0
+  itm.AudioFormat.CurrentIndex = tonumber(settings.audiofmt) or 0
   itm.Dir.Text = settings.dir
   itm.PerProject.Checked = settings.perProject == "1"
   itm.Bin.Text = settings.bin
@@ -719,7 +791,9 @@ local function main()
   itm.History.RootIsDecorated = false
 
   local function refreshFormat()
-    itm.Quality.Enabled = itm.Mode.CurrentIndex + 1 ~= MODE_AUDIO
+    local audioMode = itm.Mode.CurrentIndex + 1 == MODE_AUDIO
+    itm.Quality.Hidden = audioMode
+    itm.AudioFormat.Hidden = not audioMode
     itm.ClipFrom.Enabled = itm.Clip.Checked
     itm.ClipTo.Enabled = itm.Clip.Checked
   end
@@ -760,9 +834,8 @@ local function main()
 
   local function setTab(name)
     local isLog = name == "log"
-    itm.History.Hidden = isLog
-    itm.Hint.Hidden = isLog
-    itm.Log.Hidden = not isLog
+    itm.Views.CurrentIndex = isLog and 1 or 0
+    itm.Hint.Text = isLog and "" or HINT_TEXT
     itm.TabHistory.StyleSheet = isLog and TAB_OFF_CSS or TAB_ON_CSS
     itm.TabLog.StyleSheet = isLog and TAB_ON_CSS or TAB_OFF_CSS
   end
@@ -819,6 +892,7 @@ local function main()
     settings.bin = itm.Bin.Text
     settings.timeline = itm.Timeline.Checked and "1" or "0"
     settings.cookies = tostring(itm.Cookies.CurrentIndex)
+    settings.audiofmt = tostring(itm.AudioFormat.CurrentIndex)
     settings.playlist = itm.Playlist.Checked and "1" or "0"
     saveSettings(settings)
   end
@@ -956,6 +1030,13 @@ local function main()
       return
     end
 
+    local note
+    if looksAudioOnly(urls) and itm.Mode.CurrentIndex + 1 ~= MODE_AUDIO then
+      itm.Mode.CurrentIndex = MODE_AUDIO - 1
+      refreshFormat()
+      note = "У этих ссылок нет видео — включил режим «только звук». "
+    end
+
     local clip
     if itm.Clip.Checked then
       local from, to = parseTime(itm.ClipFrom.Text), parseTime(itm.ClipTo.Text)
@@ -971,16 +1052,21 @@ local function main()
       clip = { from = from, to = to }
     end
 
+    local cookies = itm.Cookies.CurrentIndex
+    if BROWSERS[cookies + 1] == "safari" and not safariCookiesReadable() then
+      setStatus("macOS не даёт Resolve читать cookies Safari. Для SoundCloud и YouTube вход не нужен — поставь «не использовать». Либо: Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску → добавь DaVinci Resolve и перезапусти его.", C.red)
+      return
+    end
+
     rememberSettings()
     local dir = targetDir()
     mkdir(dir)
-    local cookies = itm.Cookies.CurrentIndex
-
     startDownload({
       urls = urls,
       dir = dir,
       mode = itm.Mode.CurrentIndex + 1,
       quality = itm.Quality.CurrentIndex + 1,
+      audioFormat = itm.AudioFormat.CurrentIndex + 1,
       browser = cookies > 0 and BROWSERS[cookies + 1] or nil,
       playlist = itm.Playlist.Checked,
       clip = clip,
@@ -990,7 +1076,7 @@ local function main()
     itm.Log.PlainText = ""
     setReadouts("000", nil, nil, job.total and ("00/%02d"):format(job.total) or "00")
     itm.Bar.Text = tickBarHtml(0)
-    setStatus(("Старт загрузки: %d шт. → %s"):format(#urls, shortPath(dir)), C.text)
+    setStatus((note or "") .. ("Старт загрузки: %d шт. → %s"):format(#urls, shortPath(dir)), C.text)
     setBusy(true)
     timer:Start()
   end
@@ -1071,7 +1157,8 @@ local function main()
       setReadouts("000", nil, nil, "00")
       itm.Bar.Text = tickBarHtml(0)
       setTab("log")
-      setStatus("Ничего не скачалось — причина в журнале. Помогает «Обновить yt-dlp» или «Браузер».", C.red)
+      setStatus(explainError(st.log)
+        or "Ничего не скачалось — причина в журнале. Помогает «Обновить yt-dlp» или «Браузер».", C.red)
       return
     end
 
@@ -1089,7 +1176,7 @@ local function main()
     local text = ("Готово: %d в %s."):format(#items, where)
     local failed = st.errors > 0 or (finished.total and #files < finished.total)
     if failed then
-      text = text .. " Часть ссылок не скачалась — см. журнал."
+      text = text .. " Часть ссылок не скачалась: " .. (explainError(st.log) or "причина в журнале.")
     else
       itm.Urls.PlainText = ""
     end
@@ -1123,6 +1210,7 @@ if INET_IMPORT_NO_UI then
   return {
     startDownload = startDownload, pollJob = pollJob, stopJob = stopJob, finishJob = finishJob,
     importToResolve = importToResolve, YTDLP = YTDLP, FFMPEG = FFMPEG,
+    looksAudioOnly = looksAudioOnly, explainError = explainError,
   }
 end
 
